@@ -109,70 +109,97 @@ package object hdfs {
         .map(_.getKey.datum())
     }
 
-    /**
-     * Create a new [[com.spotify.scio.values.DistCache DistCache]] instance for a file on
-     * Hadoop/HDFS.
-     *
-     * @param path to the Hadoop/HDFS artifact
-     * @param conf optional custom Hadoop configuration
-     * @param username optional Hadoop Simple Authentication remote username
-     */
-    def hadoopDistCache[F](path: String,
-                           conf: Configuration = null,
-                           username: String = null)
-                          (initFn: File => F): DistCache[F] = self.pipelineOp {
-      if (self.isTest) {
-        self.distCache(path)(initFn)
-      } else {
-        //TODO: should upload be asynchronous, blocking on context close
-        require(self.options.getStagingLocation != null,
-          "Staging directory not set - use `--stagingLocation`!")
-        require(path != null, "Artifact path can't be null")
+    object HadoopDistCacheBuilder {
 
-        val _conf = Option(conf).getOrElse(new Configuration())
+      def apply[F](path: String)(initFn: File => F): HadoopDistCacheBuilder[F] =
+        new HadoopDistCacheBuilder[F](HDistCacheParams[F](Seq(path), {fs: Seq[File] =>
+          initFn(fs.head)}))
 
-        //TODO: should we add checksums on both src and GCS to reuse uploaded artifacts?
-        // to keep it simple, for now we upload each artifact, thus artifacts should be
-        // relatively small.
-        val pathHash = Hashing.sha1().hashString(path, Charsets.UTF_8)
-        val targetHash = pathHash.toString.substring(0, 8)
+      def apply[F](paths: Seq[String])(initFn: Seq[File] => F): HadoopDistCacheBuilder[F] =
+        new HadoopDistCacheBuilder[F](HDistCacheParams[F](paths, initFn))
 
-        logger.debug(s"Add '$path' (hash: '$pathHash') to dist cache")
-
-        val targetDistCache = new Path("distcache", s"$targetHash-${path.split("/").last}")
-
-        val target = new Path(self.options.getStagingLocation, targetDistCache)
-
-        if (username != null) {
-          UserGroupInformation.createRemoteUser(username).doAs(new PrivilegedAction[Unit] {
-            override def run(): Unit = {
-              hadoopDistCacheCopy(new Path(path), target.toUri, _conf)
-            }
-          })
-        } else {
-          hadoopDistCacheCopy(new Path(path), target.toUri, _conf)
-        }
-
-        self.distCache(target.toString)(initFn)
-      }
     }
 
-    private[scio] def hadoopDistCacheCopy(src: Path, target: URI, conf: Configuration): Unit = {
-      logger.debug(s"Will copy ${src.toUri}, to $target")
+    private case class HDistCacheParams[F](paths: Seq[String],
+                             initFn: Seq[File] => F,
+                             conf: Configuration = null,
+                             username: String = null
+                             )
 
-      val fs = src.getFileSystem(conf)
-      val inStream = fs.open(src)
+    class HadoopDistCacheBuilder[F](params: HDistCacheParams[F]) {
+      def build(): DistCache[F] = self.pipelineOp {
+        val paths = params.paths
+        val conf = params.conf
 
-      //TODO: Should we attempt to detect the Mime type rather than always using MimeTypes.BINARY?
-      val outChannel = Channels.newOutputStream(
-        self.options.getGcsUtil.create(GcsPath.fromUri(target), MimeTypes.BINARY))
+        if (self.isTest) {
+          self.distCache(paths)(params.initFn)
+        } else {
+          require(self.options.getStagingLocation != null,
+            "Staging directory not set - use `--stagingLocation`!")
+          require(!paths.contains(null), "Artifact path can't be null")
 
-      try {
-        ByteStreams.copy(inStream, outChannel)
-      } finally {
-        outChannel.close()
-        inStream.close()
+          val _conf = Option(conf).getOrElse(new Configuration())
+
+          val targetPaths = paths.foldLeft(Seq[Path]()) { (targets, path) =>
+            //TODO: should we add checksums on both src and GCS to reuse uploaded artifacts?
+            // to keep it simple, for now we upload each artifact, thus artifacts should be
+            // relatively small.
+            val pathHash = Hashing.sha1().hashString(path, Charsets.UTF_8)
+            val targetHash = pathHash.toString.substring(0, 8)
+            logger.debug(s"Add '$path' (hash: '$pathHash') to dist cache")
+
+            val targetDistCache = new Path("distcache", s"$targetHash-${path.split("/").last}")
+            val target = new Path(self.options.getStagingLocation, targetDistCache)
+
+            hadoopDistCacheCopy(new Path(path), target.toUri, _conf)
+
+            targets :+ target
+          }
+
+          self.distCache(targetPaths.map(_.toString))(params.initFn)
+        }
       }
+
+      private[scio] def hadoopDistCacheCopy(src: Path, target: URI, conf: Configuration): Unit = {
+        logger.debug(s"Will copy ${src.toUri}, to $target")
+
+        val fs = src.getFileSystem(conf)
+        val inStream = fs.open(src)
+
+        //TODO: Should we attempt to detect the Mime type rather than always using MimeTypes.BINARY?
+        val outChannel = Channels.newOutputStream(
+          self.options.getGcsUtil.create(GcsPath.fromUri(target), MimeTypes.BINARY))
+
+        try {
+          ByteStreams.copy(inStream, outChannel)
+        } finally {
+          outChannel.close()
+          inStream.close()
+        }
+      }
+
+      def withConfiguration(conf: Configuration): HadoopDistCacheBuilder[F] =
+        new HadoopDistCacheBuilder[F](params.copy(conf = conf))
+
+      def withUsername(username: String): HadoopDistCacheBuilder[F] =
+        new SimpleAuthHadoopDistCacheBuilder[F](params.copy(username = username))
+    }
+
+    private class SimpleAuthHadoopDistCacheBuilder[F](params: HDistCacheParams[F])
+      extends HadoopDistCacheBuilder[F](params) {
+
+      override def build(): DistCache[F] = {
+        def build(): DistCache[F] = super.build()
+
+        UserGroupInformation.createRemoteUser(params.username).doAs(
+          new PrivilegedAction[DistCache[F]] {
+            override def run(): DistCache[F] = build()
+          }
+        )
+      }
+
+      override def withConfiguration(conf: Configuration): HadoopDistCacheBuilder[F] =
+        new SimpleAuthHadoopDistCacheBuilder[F](params.copy(conf = conf))
     }
 
   }

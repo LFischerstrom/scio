@@ -39,13 +39,13 @@ object HadoopDistCacheExample {
     val (sc, args) = ContextAndArgs(cmdlineArgs)
 
     // declare a HDFS file to be distributed to all workers and logic to load the file
-    val dc = sc.hadoopDistCache(args.getOrElse("months",
+    val dc = sc.HadoopDistCacheBuilder(args.getOrElse("months",
       "hdfs://dataflow-samples/samples/misc/months.txt")) { f =>
         scala.io.Source.fromFile(f).getLines().map { s =>
           val t = s.split(" ")
           (t(0).toInt, t(1))
         }.toMap
-    }
+    }.build()
 
     sc
       .tableRowJsonFile(args.getOrElse("input", ExampleData.EXPORTED_WIKI_TABLE))
